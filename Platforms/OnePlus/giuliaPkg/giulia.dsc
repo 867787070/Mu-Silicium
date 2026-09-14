@@ -92,3 +92,8 @@
   # ACPI Tables
   #
   #giulia/AcpiTables.inf
+
+  #
+  # Boot Android application
+  #
+  SiliciumPkg/Applications/BootAndroid/BootAndroid.inf
