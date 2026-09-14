@@ -16,6 +16,12 @@
 #include <Protocol/FirmwareVolume2.h>
 #include <Protocol/LoadedImage.h>
 
+// FILE_GUID of SiliciumPkg/Applications/BootAndroid/BootAndroid.inf
+#define BOOT_ANDROID_FILE_GUID \
+  { 0x8F0C6E11, 0xA7B3, 0x4C2D, { 0x9E, 0x51, 0x2D, 0xB4, 0xC6, 0xE8, 0x1A, 0x0F } }
+
+STATIC CONST EFI_GUID gBootAndroidFileGuid = BOOT_ANDROID_FILE_GUID;
+
 EFI_STATUS
 BuildFwLoadOption (
   IN OUT EFI_BOOT_MANAGER_LOAD_OPTION *BootOption,
@@ -245,6 +251,7 @@ MsBootOptionsLibRegisterDefaultBootOptions ()
   // Register Default Boot Options
   RegisterFvBootOption (&gMsBootPolicyFileGuid,            L"Internal Storage", (UINTN)-1, LOAD_OPTION_ACTIVE, (UINT8 *)"SSD", sizeof ("SSD"));
   RegisterFvBootOption (&gMsBootPolicyFileGuid,            L"USB Storage",      (UINTN)-1, LOAD_OPTION_ACTIVE, (UINT8 *)"USB", sizeof ("USB"));
+  RegisterFvBootOption (&gBootAndroidFileGuid,             L"Boot Android",     (UINTN)-1, LOAD_OPTION_ACTIVE, NULL, 0);
   RegisterFvBootOption (FixedPcdGetPtr (PcdUfpLoaderFile), L"FFU Mode",         (UINTN)-1, LOAD_OPTION_HIDDEN, NULL, 0);
 
   // Get Platform Boot Options
