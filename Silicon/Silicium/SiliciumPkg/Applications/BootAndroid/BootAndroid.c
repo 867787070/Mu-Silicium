@@ -66,8 +66,8 @@ Gunzip (
 {
   EFI_STATUS              Status;
   EFI_DECOMPRESS_PROTOCOL *Decompress;
-  UINTN                   UncompressedSize = 0;
-  UINTN                   ScratchSize      = 0;
+  UINT32                  UncompressedSize = 0;
+  UINT32                  ScratchSize      = 0;
   VOID                    *Dst;
 
   *DstSize = 0;
