@@ -23,9 +23,7 @@
   BaseLib
   BaseMemoryLib
   MemoryAllocationLib
-  DevicePathLib
 
 [Protocols]
-  gEfiBlockIoProtocolGuid
-  gEfiPartitionInfoProtocolGuid
+  gEfiSimpleFileSystemProtocolGuid
   gEfiDecompressProtocolGuid
