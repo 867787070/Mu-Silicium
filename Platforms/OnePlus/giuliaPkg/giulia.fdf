@@ -85,6 +85,9 @@ READ_LOCK_STATUS   = TRUE
   !include Include/DXE.inc
   !include Include/RAW.inc
 
+  # Boot Android application
+  INF SiliciumPkg/Applications/BootAndroid/BootAndroid.inf
+
   # RAM Manager
   INF SiliciumPkg/Drivers/RamManagerDxe/RamManagerDxe.inf
 
