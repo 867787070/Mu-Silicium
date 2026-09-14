@@ -24,6 +24,9 @@
   BaseMemoryLib
   MemoryAllocationLib
 
+[Guids]
+  gEfiFileInfoGuid
+
 [Protocols]
   gEfiSimpleFileSystemProtocolGuid
   gEfiDecompressProtocolGuid
