@@ -1,10 +1,13 @@
 /** @file
   Minimal "Boot Android" UEFI application for giulia (OnePlus 13R / Ace 5).
 
-  Reads the Android boot image (boot.img) from the "boot"/"boot_a" GPT
-  partition, parses the header (v0-v4), gunzips the kernel/ramdisk when
-  needed, loads the kernel + DTB + initramfs, and transfers control using
+  Reads the Android boot image from a FILE on a FAT filesystem (default
+  "\android\boot.img"), parses the header (v0-v4), gunzips the kernel/ramdisk
+  when needed, loads the kernel + DTB + initramfs, and transfers control using
   the arm64 Linux boot protocol (x0 = DTB address).
+
+  The boot image is expected to be stored as a file (NOT on the boot
+  partition, which carries BootShim.bin).
 
   NOTE: first revision. The DTB source (appended-to-kernel vs. header dtb
   field) and the kernel load address may need per-image adjustment after
@@ -20,21 +23,20 @@
 #include <Library/MemoryAllocationLib.h>
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiLib.h>
-#include <Library/DevicePathLib.h>
 
-#include <Protocol/BlockIo.h>
-#include <Protocol/DevicePath.h>
-#include <Protocol/PartitionInfo.h>
+#include <Guid/FileInfo.h>
 #include <Protocol/Decompress.h>
+#include <Protocol/SimpleFileSystem.h>
 
 #include "bootimg.h"
 
 #define GZIP_MAGIC_0  0x1F
 #define GZIP_MAGIC_1  0x8B
 
+// Path of the Android boot image on a FAT volume (e.g. the ESP).
+#define ANDROID_BOOT_IMAGE_PATH  L"\\android\\boot.img"
+
 #define KERNEL_LOAD_ADDR  0x80000ULL   // typical arm64 Image load address
-#define RAMDISK_LOAD_ADDR 0x90000000ULL
-#define DTB_LOAD_ADDR     0x8f000000ULL
 
 typedef VOID (*ARM64_KERNEL_ENTRY)(
   UINTN  FdtAddress,
@@ -43,8 +45,6 @@ typedef VOID (*ARM64_KERNEL_ENTRY)(
   UINTN  X3
   );
 
-// ---------------------------------------------------------------------------
-// Returns TRUE if Buffer starts with a gzip stream.
 // ---------------------------------------------------------------------------
 STATIC
 BOOLEAN
@@ -55,9 +55,6 @@ IsGzip (
   return (Buffer != NULL) && (Buffer[0] == GZIP_MAGIC_0) && (Buffer[1] == GZIP_MAGIC_1);
 }
 
-// ---------------------------------------------------------------------------
-// Decompress a gzip stream using the EFI decompression protocol.
-// Returns NULL on failure; caller frees with FreePool.
 // ---------------------------------------------------------------------------
 STATIC
 VOID *
@@ -77,13 +74,11 @@ Gunzip (
 
   Status = gBS->LocateProtocol (&gEfiDecompressProtocolGuid, NULL, (VOID **)&Decompress);
   if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_ERROR, "BootAndroid: LocateProtocol(Decompress) failed: %r\n", Status));
     return NULL;
   }
 
   Status = Decompress->GetInfo (Decompress, Src, SrcSize, &UncompressedSize, &ScratchSize);
   if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_ERROR, "BootAndroid: Decompress.GetInfo failed: %r\n", Status));
     return NULL;
   }
 
@@ -94,7 +89,6 @@ Gunzip (
 
   Status = Decompress->Decompress (Decompress, Src, SrcSize, Dst, UncompressedSize, NULL, 0);
   if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_ERROR, "BootAndroid: Decompress failed: %r\n", Status));
     FreePool (Dst);
     return NULL;
   }
@@ -104,88 +98,89 @@ Gunzip (
 }
 
 // ---------------------------------------------------------------------------
-// Locate the GPT partition whose name matches one of BootPartNames.
+// Open and read ANDROID_BOOT_IMAGE_PATH from the first FAT volume that has it.
+// Caller frees with FreePool.
 // ---------------------------------------------------------------------------
 STATIC
-EFI_BLOCK_IO_PROTOCOL *
-LocateBootPartition (
-  IN CHAR16 **BootPartNames,
-  IN UINTN    NameCount
+UINT8 *
+ReadBootImageFile (
+  OUT UINTN  *Size
   )
 {
-  EFI_STATUS                 Status;
-  UINTN                      HandleCount = 0;
-  EFI_HANDLE                 *Handles    = NULL;
-  EFI_BLOCK_IO_PROTOCOL      *BlockIo    = NULL;
-  UINTN                      Index;
-  UINTN                      NameIndex;
+  EFI_STATUS                          Status;
+  UINTN                               HandleCount = 0;
+  EFI_HANDLE                          *Handles    = NULL;
+  UINTN                               Index;
+  UINT8                               *Buffer     = NULL;
 
-  Status = gBS->LocateHandleBuffer (ByProtocol, &gEfiBlockIoProtocolGuid, NULL,
+  Status = gBS->LocateHandleBuffer (ByProtocol, &gEfiSimpleFileSystemProtocolGuid, NULL,
                                     &HandleCount, &Handles);
   if (EFI_ERROR (Status) || (HandleCount == 0)) {
     return NULL;
   }
 
   for (Index = 0; Index < HandleCount; Index++) {
-    EFI_PARTITION_INFO_PROTOCOL *PartInfo = NULL;
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Sfs  = NULL;
+    EFI_FILE_PROTOCOL               *Root = NULL;
+    EFI_FILE_PROTOCOL               *File = NULL;
+    EFI_FILE_INFO                   *Info = NULL;
+    UINTN                            InfoSize = 0;
 
-    Status = gBS->HandleProtocol (Handles[Index], &gEfiPartitionInfoProtocolGuid, (VOID **)&PartInfo);
-    if (EFI_ERROR (Status) || (PartInfo == NULL) || (PartInfo->Type != PartTypeGpt)) {
+    Status = gBS->HandleProtocol (Handles[Index], &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Sfs);
+    if (EFI_ERROR (Status) || (Sfs == NULL)) {
       continue;
     }
 
-    for (NameIndex = 0; NameIndex < NameCount; NameIndex++) {
-      if (StrCmp (PartInfo->Info.Gpt.PartitionName, BootPartNames[NameIndex]) == 0) {
-        Status = gBS->HandleProtocol (Handles[Index], &gEfiBlockIoProtocolGuid, (VOID **)&BlockIo);
-        if (!EFI_ERROR (Status)) {
-          goto Done;
-        }
-      }
+    Status = Sfs->OpenVolume (Sfs, &Root);
+    if (EFI_ERROR (Status)) {
+      continue;
     }
+
+    Status = Root->Open (Root, &File, ANDROID_BOOT_IMAGE_PATH, EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR (Status)) {
+      continue;
+    }
+
+    // Get file size.
+    InfoSize = 0;
+    Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, NULL);
+    if ((Status != EFI_BUFFER_TOO_SMALL) || (InfoSize == 0)) {
+      continue;
+    }
+    Info = AllocatePool (InfoSize);
+    if (Info == NULL) {
+      continue;
+    }
+    Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
+    if (EFI_ERROR (Status)) {
+      FreePool (Info);
+      continue;
+    }
+
+    Buffer = AllocatePool ((UINTN)Info->FileSize);
+    if (Buffer == NULL) {
+      FreePool (Info);
+      continue;
+    }
+
+    *Size = (UINTN)Info->FileSize;
+    Status = File->Read (File, Size, Buffer);
+    FreePool (Info);
+    if (EFI_ERROR (Status)) {
+      FreePool (Buffer);
+      Buffer = NULL;
+      continue;
+    }
+
+    break;
   }
 
-Done:
   if (Handles != NULL) {
     FreePool (Handles);
   }
-  return BlockIo;
-}
-
-// ---------------------------------------------------------------------------
-// Read the entire boot partition into memory (caller frees with FreePool).
-// ---------------------------------------------------------------------------
-STATIC
-UINT8 *
-ReadBootPartition (
-  IN  EFI_BLOCK_IO_PROTOCOL *BlockIo,
-  OUT UINTN                  *Size
-  )
-{
-  EFI_STATUS  Status;
-  UINTN       BufferSize;
-  UINT8       *Buffer;
-
-  BufferSize = (UINTN)(BlockIo->Media->LastBlock + 1) * BlockIo->Media->BlockSize;
-  Buffer     = AllocatePool (BufferSize);
-  if (Buffer == NULL) {
-    return NULL;
-  }
-
-  Status = BlockIo->ReadBlocks (BlockIo, BlockIo->Media->MediaId, 0, BufferSize, Buffer);
-  if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_ERROR, "BootAndroid: ReadBlocks failed: %r\n", Status));
-    FreePool (Buffer);
-    return NULL;
-  }
-
-  *Size = BufferSize;
   return Buffer;
 }
 
-// ---------------------------------------------------------------------------
-// Compute the offset (page aligned) of kernel/ramdisk within the boot image.
-// Returns the kernel offset via *KernelOffset and the ramdisk offset via
-// *RamdiskOffset. PageSize is from the header.
 // ---------------------------------------------------------------------------
 STATIC
 UINTN
@@ -205,40 +200,31 @@ BootAndroidEntry (
   IN EFI_SYSTEM_TABLE  *SystemTable
   )
 {
-  EFI_STATUS            Status;
-  EFI_BLOCK_IO_PROTOCOL *BlockIo;
-  UINT8                 *Image = NULL;
-  UINTN                 ImageSize;
-  BOOT_IMG_HDR_V0       *Hdr;
-  UINT32                PageSize;
-  UINT32                Version;
-  UINTN                 KernelOffset;
-  UINTN                 RamdiskOffset;
-  UINT8                 *Kernel;
-  UINTN                 KernelSize;
-  UINT8                 *Ramdisk = NULL;
-  UINTN                 RamdiskSize = 0;
-  UINT8                 *Dtb = NULL;
-  UINTN                 DtbSize = 0;
-  ARM64_KERNEL_ENTRY    Entry;
-  UINTN                 FdtAddress;
-  CHAR16                *BootNames[] = { L"boot", L"boot_a", L"boot_b" };
+  EFI_STATUS             Status;
+  UINT8                  *Image = NULL;
+  UINTN                  ImageSize;
+  BOOT_IMG_HDR_V0        *Hdr;
+  UINT32                 PageSize;
+  UINT32                 Version;
+  UINTN                  KernelOffset;
+  UINTN                  RamdiskOffset;
+  UINT8                  *Kernel;
+  UINTN                  KernelSize;
+  UINT8                  *Ramdisk = NULL;
+  UINTN                  RamdiskSize = 0;
+  UINT8                  *Dtb = NULL;
+  UINTN                  DtbSize = 0;
+  ARM64_KERNEL_ENTRY     Entry;
+  UINTN                  FdtAddress;
 
   DEBUG ((DEBUG_INFO, "BootAndroid: starting\n"));
 
-  BlockIo = LocateBootPartition (BootNames, ARRAY_SIZE (BootNames));
-  if (BlockIo == NULL) {
-    Print (L"BootAndroid: no boot partition found\n");
+  Image = ReadBootImageFile (&ImageSize);
+  if (Image == NULL) {
+    Print (L"BootAndroid: cannot open %s\n", ANDROID_BOOT_IMAGE_PATH);
     return EFI_NOT_FOUND;
   }
 
-  Image = ReadBootPartition (BlockIo, &ImageSize);
-  if (Image == NULL) {
-    Print (L"BootAndroid: failed to read boot partition\n");
-    return EFI_DEVICE_ERROR;
-  }
-
-  // Validate magic + header.
   Hdr = (BOOT_IMG_HDR_V0 *)Image;
   if (CompareMem (Hdr->Magic, BOOT_MAGIC, BOOT_MAGIC_SIZE) != 0) {
     Print (L"BootAndroid: bad boot image magic\n");
@@ -248,14 +234,11 @@ BootAndroidEntry (
   Version  = Hdr->HeaderVersion;
   PageSize = (Hdr->PageSize == 0) ? 2048 : Hdr->PageSize;
 
-  // Locate kernel/ramdisk in the image (page aligned).
   KernelOffset  = AlignPage (sizeof (BOOT_IMG_HDR_V0), PageSize);
   RamdiskOffset = AlignPage (KernelOffset + Hdr->KernelSize, PageSize);
 
-  if (Version >= 1) {
-    // v1/v2 append recovery_dtbo + header_size; account for the larger header.
-    KernelOffset = AlignPage (((BOOT_IMG_HDR_V1_EXTRA *)(Image + sizeof (BOOT_IMG_HDR_V0)))->HeaderSize,
-                              PageSize);
+  if (Version >= 1 && Version < 3) {
+    KernelOffset  = AlignPage (((BOOT_IMG_HDR_V1_EXTRA *)(Image + sizeof (BOOT_IMG_HDR_V0)))->HeaderSize, PageSize);
     RamdiskOffset = AlignPage (KernelOffset + Hdr->KernelSize, PageSize);
   }
 
@@ -265,43 +248,31 @@ BootAndroidEntry (
     RamdiskOffset = AlignPage (KernelOffset + Hdr3->KernelSize, PageSize);
   }
 
-  // Kernel
   Kernel     = Image + KernelOffset;
   KernelSize = Hdr->KernelSize;
 
-  // Ramdisk (v0/v1/v2). v3/v4 have no second stage, ramdisk follows kernel.
   if (Hdr->RamdiskSize != 0) {
     Ramdisk     = Image + RamdiskOffset;
     RamdiskSize = Hdr->RamdiskSize;
   }
 
-  // DTB: v2+ carries it in the header (after recovery_dtbo).
   if (Version >= 2) {
     BOOT_IMG_HDR_V2_EXTRA *Extra = (BOOT_IMG_HDR_V2_EXTRA *)
       (Image + sizeof (BOOT_IMG_HDR_V0) + sizeof (BOOT_IMG_HDR_V1_EXTRA));
     if (Extra->DtbSize != 0) {
-      UINTN DtbOffset = (UINTN)((Version >= 3) ? (RamdiskOffset + Hdr->RamdiskSize)
-                                               : (Extra->DtbAddr));
-      // For v2 the DTB is page-aligned after recovery_dtbo; approximate by
-      // scanning for the FDT magic as a fallback.
-      if (Version >= 2 && Version < 3) {
-        UINTN Scan;
-        for (Scan = RamdiskOffset + AlignPage (RamdiskSize, PageSize);
-             Scan + 8 <= ImageSize; Scan += PageSize) {
-          if (*(UINT32 *)(Image + Scan) == SwapBytes32 (0xd00dfeed)) {
-            Dtb = Image + Scan;
-            DtbSize = Extra->DtbSize;
-            break;
-          }
+      UINTN Scan;
+      DtbSize = Extra->DtbSize;
+      for (Scan = RamdiskOffset + AlignPage (RamdiskSize, PageSize);
+           Scan + 8 <= ImageSize; Scan += PageSize) {
+        if (*(UINT32 *)(Image + Scan) == SwapBytes32 (0xd00dfeed)) {
+          Dtb = Image + Scan;
+          break;
         }
-      } else {
-        Dtb = Image + DtbOffset;
-        DtbSize = Extra->DtbSize;
       }
     }
   }
 
-  // --- Gunzip kernel/ramdisk if compressed ---
+  // --- Gunzip kernel/ramdisk if compressed, then load ---
   {
     UINT8 *K = Kernel;
     UINTN  Ks = KernelSize;
@@ -313,7 +284,6 @@ BootAndroidEntry (
       }
     }
 
-    // Load kernel to its run address.
     Status = gBS->AllocatePages (AllocateAddress, EfiLoaderData,
                                  EFI_SIZE_TO_PAGES (Ks), (EFI_PHYSICAL_ADDRESS *)&Kernel);
     if (EFI_ERROR (Status)) {
@@ -342,8 +312,6 @@ BootAndroidEntry (
     }
   }
 
-  // We reuse the boot image buffer region for the DTB; if none was found,
-  // pass 0 (kernel without appended DTB may still boot on some configs).
   FdtAddress = (Dtb != NULL) ? (UINTN)Dtb : 0;
 
   DEBUG ((DEBUG_INFO, "BootAndroid: kernel=0x%lx (%lx bytes), dtb=0x%lx, ramdisk=0x%lx (%lx)\n",
@@ -356,7 +324,6 @@ BootAndroidEntry (
     UINTN                  MapKey;
     UINTN                  DescriptorSize;
     UINT32                 DescriptorVersion;
-    UINTN                  Pages = 0;
 
     do {
       Status = gBS->GetMemoryMap (&MemMapSize, MemMap, &MapKey, &DescriptorSize, &DescriptorVersion);
@@ -383,7 +350,6 @@ BootAndroidEntry (
     Entry (FdtAddress, 0, 0, 0);
   }
 
-  // Not reached.
   return EFI_SUCCESS;
 
 Error:
